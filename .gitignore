@@ -176,3 +176,12 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Local BiPiper deployment artifacts
+/SVA/
+/checkpoints/
+/policy_records/
+/preview.png
+.env.*
+*.hdf5
+*.h5
