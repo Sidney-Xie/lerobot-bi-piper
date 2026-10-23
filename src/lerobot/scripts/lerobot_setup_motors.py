@@ -30,6 +30,8 @@ import draccus
 
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
+    bi_piper,
+    bi_piperx,
     bi_rebot_b601_follower,
     bi_so_follower,
     koch_follower,

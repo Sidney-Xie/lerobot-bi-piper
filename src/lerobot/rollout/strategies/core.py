@@ -19,7 +19,7 @@ from __future__ import annotations
 import abc
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
 from lerobot.utils.action_interpolator import ActionInterpolator
@@ -29,6 +29,7 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import log_visualization_data
 
 from ..inference import InferenceEngine
+from ..telemetry import JsonlTelemetryWriter
 
 if TYPE_CHECKING:
     from ..configs import RolloutStrategyConfig
@@ -51,6 +52,9 @@ class RolloutStrategy(abc.ABC):
         self._interpolator: ActionInterpolator | None = None
         self._warmup_flushed: bool = False
         self._cached_obs_processed: dict | None = None
+        self._telemetry: JsonlTelemetryWriter | None = None
+        self._runtime_context: RuntimeContext | None = None
+        self._telemetry_state_names: list[str] = []
 
     def _init_engine(self, ctx: RolloutContext) -> None:
         """Attach the inference engine and action interpolator, then start the backend.
@@ -67,7 +71,62 @@ class RolloutStrategy(abc.ABC):
         self._engine.start()
         self._warmup_flushed = False
         self._cached_obs_processed = None
+        self._runtime_context = ctx.runtime
+        state_feature = ctx.data.hw_features.get("observation.state", {})
+        self._telemetry_state_names = list(state_feature.get("names") or [])
         logger.info("Inference engine started")
+
+    def _init_telemetry(self, ctx: RolloutContext) -> None:
+        """Start optional JSONL telemetry for strategies that emit cycles."""
+        if ctx.runtime.cfg.inference_log_path is not None:
+            self._telemetry = JsonlTelemetryWriter(ctx.runtime.cfg.inference_log_path)
+            self._telemetry.start()
+            logger.info("Writing rollout telemetry to %s", ctx.runtime.cfg.inference_log_path)
+
+    def _close_telemetry(self) -> None:
+        if self._telemetry is not None:
+            self._telemetry.close()
+            self._telemetry = None
+
+    def _log_control_cycle(
+        self,
+        *,
+        step: int,
+        obs_raw: dict[str, Any],
+        action_dict: dict | None,
+        control_dt: float,
+    ) -> None:
+        if self._telemetry is None:
+            return
+        runtime = self._runtime_context
+        if runtime is None:
+            return
+        if self._telemetry_state_names:
+            state = [obs_raw[name] for name in self._telemetry_state_names if name in obs_raw]
+        else:
+            state = {
+                key: value
+                for key, value in obs_raw.items()
+                if not hasattr(value, "shape") or getattr(value, "ndim", 0) <= 1
+            }
+        inference_telemetry = self._engine.get_inference_telemetry() if self._engine is not None else {}
+        self._telemetry.submit(
+            {
+                "timestamp_ns": time.time_ns(),
+                "timestamp": time.time(),
+                "step": step,
+                "state_names": self._telemetry_state_names or None,
+                "state": state,
+                "action": action_dict,
+                "processed_action": runtime.last_processed_action,
+                "sent_action": runtime.last_sent_action,
+                "send_success": runtime.last_send_success,
+                "send_error": runtime.last_send_error,
+                "control_dt": control_dt,
+                "action_available": action_dict is not None,
+                **inference_telemetry,
+            }
+        )
 
     def _process_observation_and_notify(self, processors: ProcessorContext, obs_raw: dict) -> dict:
         """Run the observation processor and notify the engine — throttled to policy ticks.
@@ -120,25 +179,54 @@ class RolloutStrategy(abc.ABC):
         """Stop the inference engine, optionally return robot to initial position, and disconnect hardware."""
         if self._engine is not None:
             logger.info("Stopping inference engine...")
-            self._engine.stop()
+            try:
+                self._engine.stop()
+            except Exception:
+                logger.exception("Failed to stop inference engine during teardown")
         robot = hw.robot_wrapper.inner
         if robot.is_connected:
             if return_to_initial_position and hw.initial_position:
-                logger.info("Returning robot to initial position before shutdown...")
-                self._return_to_initial_position(hw)
+                safe_to_return = True
+                if bool(getattr(robot, "has_hardware_fault", False)):
+                    recover = getattr(robot, "recover_for_safe_return", None)
+                    try:
+                        safe_to_return = callable(recover) and bool(recover())
+                    except Exception:
+                        logger.exception("Robot fault recovery failed during teardown")
+                        safe_to_return = False
+                    if not safe_to_return:
+                        logger.error(
+                            "Skipping automatic return because the robot did not recover from its hardware fault."
+                        )
+
+                returned = False
+                if safe_to_return:
+                    logger.info("Returning robot to initial position before shutdown...")
+                    returned = self._return_to_initial_position(hw)
+
+                if not returned:
+                    preserve_torque = getattr(robot, "preserve_torque_for_manual_recovery", None)
+                    if callable(preserve_torque):
+                        preserve_torque()
             elif not return_to_initial_position:
                 logger.info(
                     "Skipping return-to-initial-position (disabled by config); leaving robot in final pose."
                 )
             logger.info("Disconnecting robot...")
-            robot.disconnect()
+            try:
+                robot.disconnect()
+            except Exception:
+                logger.exception("Failed to disconnect robot during teardown")
         teleop = hw.teleop
         if teleop is not None and teleop.is_connected:
             logger.info("Disconnecting teleoperator...")
-            teleop.disconnect()
+            try:
+                teleop.disconnect()
+            except Exception:
+                logger.exception("Failed to disconnect teleoperator during teardown")
 
     @staticmethod
-    def _return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> None:
+    def _return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> bool:
         """Smoothly interpolate the robot back to its initial position."""
         robot = hw.robot_wrapper
         target = hw.initial_position
@@ -153,8 +241,10 @@ class RolloutStrategy(abc.ABC):
                     interp[k] = current_pos[k] * (1 - t) + target[k] * t
                 robot.send_action(interp)
                 precise_sleep(1 / fps)
+            return True
         except Exception as e:
             logger.warning("Could not return to initial position: %s", e)
+            return False
 
     @staticmethod
     def _log_telemetry(
@@ -286,6 +376,12 @@ def send_next_action(
     engine = ctx.policy.inference
     features = ctx.data.dataset_features
     ordered_keys = ctx.data.ordered_action_keys
+    runtime = ctx.runtime
+    runtime.last_policy_action = None
+    runtime.last_processed_action = None
+    runtime.last_sent_action = None
+    runtime.last_send_success = False
+    runtime.last_send_error = None
 
     if interpolator.needs_new_action():
         obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
@@ -300,6 +396,21 @@ def send_next_action(
     if len(interp) != len(ordered_keys):
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
-    processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
-    ctx.hardware.robot_wrapper.send_action(processed)
+    runtime.last_policy_action = action_dict
+    try:
+        processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
+        runtime.last_processed_action = processed
+    except Exception as exc:
+        runtime.last_send_error = f"action_processor: {exc}"
+        raise
+    if ctx.runtime.shutdown_event.is_set() or engine.failed:
+        ctx.runtime.shutdown_event.set()
+        return None
+    try:
+        sent = ctx.hardware.robot_wrapper.send_action(processed)
+        runtime.last_sent_action = sent if isinstance(sent, dict) else processed
+        runtime.last_send_success = True
+    except Exception as exc:
+        runtime.last_send_error = f"send_action: {exc}"
+        raise
     return action_dict

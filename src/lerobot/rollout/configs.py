@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import draccus
 
@@ -230,7 +231,7 @@ class RolloutConfig:
     # Strategy (polymorphic: --strategy.type=base|sentry|highlight|dagger)
     strategy: RolloutStrategyConfig = field(default_factory=BaseStrategyConfig)
 
-    # Inference backend (polymorphic: --inference.type=sync|rtc)
+    # Inference backend (polymorphic: --inference.type=sync|rtc|remote)
     inference: InferenceEngineConfig = field(default_factory=SyncInferenceConfig)
 
     # Dataset (required for sentry, highlight, dagger; None for base)
@@ -242,6 +243,8 @@ class RolloutConfig:
     interpolation_multiplier: int = 1
     device: str | None = None
     task: str = ""
+    # Optional per-control-cycle JSONL telemetry for hardware rollouts.
+    inference_log_path: Path | None = None
     display_data: bool = False
     # Visualization backend used when display_data is True: "rerun" or "foxglove".
     display_mode: str = "rerun"

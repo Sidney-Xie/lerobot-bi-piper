@@ -1585,6 +1585,26 @@ def test_multiple_processors_same_directory():
         assert len(loaded_post) == 1
 
 
+def test_local_processor_artifacts_resolve_relative_paths(tmp_path: Path):
+    artifact_dir = tmp_path / "tokenizer"
+    artifact_dir.mkdir()
+    config = {
+        "name": "artifact_pipeline",
+        "steps": [
+            {
+                "registry_name": "tokenizer_processor",
+                "config": {"tokenizer_name": "tokenizer"},
+                "artifacts": {"tokenizer_name": "tokenizer"},
+            }
+        ],
+    }
+
+    resolved = DataProcessorPipeline._resolve_local_artifacts(config, tmp_path, True)
+
+    assert resolved["steps"][0]["config"]["tokenizer_name"] == str(artifact_dir)
+    assert config["steps"][0]["config"]["tokenizer_name"] == "tokenizer"
+
+
 def test_explicit_config_filename_loading():
     """Test explicit config filename loading (no more auto-detection)."""
     step = MockStepWithTensorState()

@@ -124,6 +124,7 @@ class RTCInferenceEngine(InferenceEngine):
         rtc_queue_threshold: int = 30,
         shutdown_event: Event | None = None,
     ) -> None:
+        super().__init__()
         self._policy = policy
         self._preprocessor = preprocessor
         self._postprocessor = postprocessor
@@ -197,6 +198,7 @@ class RTCInferenceEngine(InferenceEngine):
 
     def start(self) -> None:
         """Launch the RTC background thread."""
+        self._reset_inference_telemetry()
         self._action_queue = ActionQueue(self._rtc_config)
         self._obs_holder = {
             "obs": None,
@@ -237,6 +239,7 @@ class RTCInferenceEngine(InferenceEngine):
     def reset(self) -> None:
         """Reset the policy, processors, and action queue."""
         logger.info("Resetting RTC inference state (policy + processors + queue)")
+        self._reset_inference_telemetry()
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
@@ -252,6 +255,10 @@ class RTCInferenceEngine(InferenceEngine):
         if self._action_queue is None:
             return None
         return self._action_queue.get()
+
+    def _inference_queue_size(self) -> int:
+        queue = self._action_queue
+        return 0 if queue is None else queue.qsize()
 
     def notify_observation(self, obs: dict) -> None:
         """Publish the latest observation for the RTC thread to consume."""
@@ -287,6 +294,7 @@ class RTCInferenceEngine(InferenceEngine):
 
                 if queue.qsize() <= self._rtc_queue_threshold:
                     try:
+                        attempt = self._begin_inference()
                         current_time = time.perf_counter()
                         idx_before = queue.get_action_index()
                         prev_actions = queue.get_left_over()
@@ -340,6 +348,7 @@ class RTCInferenceEngine(InferenceEngine):
                             latency_tracker.add(new_latency)
 
                         queue.merge(original, processed, new_delay, idx_before)
+                        self._finish_inference(attempt)
 
                         if (
                             is_warmup

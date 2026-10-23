@@ -14,23 +14,31 @@
 
 """Inference engine package — backend-agnostic action production.
 
-Concrete backends (``sync``, ``rtc``, ...) expose the same small interface so
+Concrete backends (``sync``, ``rtc``, ``remote``, ...) expose the same small interface so
 rollout strategies never branch on which backend is in use.
 """
 
 from .base import InferenceEngine
 from .factory import (
     InferenceEngineConfig,
+    OpenPIWebSocketInferenceConfig,
+    RemoteInferenceConfig,
     RTCInferenceConfig,
     SyncInferenceConfig,
     create_inference_engine,
 )
+from .openpi_websocket import OpenPIWebSocketInferenceEngine
+from .remote import RemoteInferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
 __all__ = [
     "InferenceEngine",
     "InferenceEngineConfig",
+    "OpenPIWebSocketInferenceConfig",
+    "OpenPIWebSocketInferenceEngine",
+    "RemoteInferenceConfig",
+    "RemoteInferenceEngine",
     "RTCInferenceConfig",
     "RTCInferenceEngine",
     "SyncInferenceConfig",

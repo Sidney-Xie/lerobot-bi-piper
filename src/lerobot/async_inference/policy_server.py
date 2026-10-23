@@ -30,6 +30,7 @@ import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -78,6 +79,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._predicted_timesteps = set()
 
         self.last_processed_obs = None
+        self._policy_load_lock = threading.Lock()
+        self._loaded_policy_key: tuple | None = None
+        self._client_lock = threading.Lock()
+        self._owner_peer: str | None = None
 
         # Attributes will be set by SendPolicyInstructions
         self.device = None
@@ -97,16 +102,143 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return self.policy.config.image_features
 
     def _reset_server(self) -> None:
-        """Flushes server state when new client connects."""
+        """Flush session state when the owning client starts a new session."""
         # only running inference on the latest observation received by the server
         self.shutdown_event.set()
         self.observation_queue = Queue(maxsize=1)
 
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
+        self.last_processed_obs = None
+        self.fps_tracker.reset()
+
+    def _claim_client(self, context) -> tuple[bool, str]:
+        """Atomically reserve this process for the first client peer."""
+        client_id = context.peer()
+        with self._client_lock:
+            if self._owner_peer is None:
+                self._owner_peer = client_id
+            authorized = self._owner_peer == client_id
+
+        if not authorized:
+            context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "This policy server already belongs to another client. "
+                "Run one server process per robot and restart it to transfer ownership.",
+            )
+        return authorized, client_id
+
+    def _validate_client(self, context) -> tuple[bool, str]:
+        """Reject RPCs that did not originate from the peer which called Ready."""
+        client_id = context.peer()
+        with self._client_lock:
+            owner_peer = self._owner_peer
+
+        if owner_peer is None:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Call Ready before using policy RPCs.")
+            return False, client_id
+        if owner_peer != client_id:
+            context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "This policy server already belongs to another client. "
+                "Run one server process per robot and restart it to transfer ownership.",
+            )
+            return False, client_id
+        return True, client_id
+
+    @staticmethod
+    def _canonical_policy_path(path_or_id: str) -> str:
+        path = Path(path_or_id).expanduser()
+        return str(path.resolve()) if path.exists() else path_or_id
+
+    def _policy_key(self, policy_specs: RemotePolicyConfig) -> tuple:
+        return (
+            policy_specs.policy_type,
+            self._canonical_policy_path(policy_specs.pretrained_name_or_path),
+            policy_specs.pretrained_revision,
+            policy_specs.device,
+            tuple(sorted(policy_specs.rename_map.items())),
+        )
+
+    def _reset_policy_state(self) -> None:
+        for component in (self.policy, self.preprocessor, self.postprocessor):
+            reset = getattr(component, "reset", None)
+            if callable(reset):
+                reset()
+
+    def _configure_policy(self, policy_specs: RemotePolicyConfig) -> bool:
+        """Load a requested policy or reset and reuse the matching resident one."""
+        requested_key = self._policy_key(policy_specs)
+        with self._policy_load_lock:
+            if self.policy is not None and requested_key == self._loaded_policy_key:
+                self._reset_policy_state()
+                self.logger.info(
+                    "Reusing resident policy %s from %s",
+                    policy_specs.policy_type,
+                    policy_specs.pretrained_name_or_path,
+                )
+                return False
+
+            policy_class = get_policy_class(policy_specs.policy_type)
+            started_at = time.perf_counter()
+            policy = policy_class.from_pretrained(
+                policy_specs.pretrained_name_or_path,
+                revision=policy_specs.pretrained_revision,
+            )
+            policy = policy.to(policy_specs.device)
+            policy.eval()
+
+            device_override = {"device": policy_specs.device}
+            preprocessor, postprocessor = make_pre_post_processors(
+                policy.config,
+                pretrained_path=policy_specs.pretrained_name_or_path,
+                pretrained_revision=policy_specs.pretrained_revision,
+                preprocessor_overrides={
+                    "device_processor": device_override,
+                    "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                },
+                postprocessor_overrides={"device_processor": device_override},
+            )
+
+            # Publish only after every load step succeeds so a bad replacement
+            # request cannot discard a healthy resident policy.
+            self.policy = policy
+            self.preprocessor = preprocessor
+            self.postprocessor = postprocessor
+            self._loaded_policy_key = requested_key
+            self.logger.info(
+                "Loaded resident policy on %s in %.4f seconds",
+                policy_specs.device,
+                time.perf_counter() - started_at,
+            )
+            return True
+
+    def preload_configured_policy(self) -> bool:
+        if self.config.policy_path is None:
+            return False
+        if self.config.policy_type not in SUPPORTED_POLICIES:
+            raise ValueError(
+                f"Policy type {self.config.policy_type} not supported. "
+                f"Supported policies: {SUPPORTED_POLICIES}"
+            )
+        specs = RemotePolicyConfig(
+            policy_type=self.config.policy_type,
+            pretrained_name_or_path=self.config.policy_path,
+            lerobot_features={},
+            actions_per_chunk=1,
+            device=self.config.policy_device,
+            rename_map=self.config.rename_map,
+            pretrained_revision=self.config.pretrained_revision,
+        )
+        self._configure_policy(specs)
+        self.device = specs.device
+        self.policy_type = specs.policy_type
+        return True
 
     def Ready(self, request, context):  # noqa: N802
-        client_id = context.peer()
+        authorized, client_id = self._claim_client(context)
+        if not authorized:
+            return services_pb2.Empty()
         self.logger.info(f"Client {client_id} connected and ready")
         self._reset_server()
         self.shutdown_event.clear()
@@ -116,11 +248,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def SendPolicyInstructions(self, request, context):  # noqa: N802
         """Receive policy instructions from the robot client"""
 
+        authorized, client_id = self._validate_client(context)
+        if not authorized:
+            return services_pb2.Empty()
+
         if not self.running:
             self.logger.warning("Server is not running. Ignoring policy instructions.")
             return services_pb2.Empty()
-
-        client_id = context.peer()
 
         policy_specs = pickle.loads(request.data)  # nosec
 
@@ -141,38 +275,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Device: {policy_specs.device}"
         )
 
+        self._configure_policy(policy_specs)
+
+        # Publish request-specific metadata only after the resident policy and
+        # processors were loaded (or successfully matched) as one unit.
         self.device = policy_specs.device
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
-        policy_class = get_policy_class(self.policy_type)
-
-        start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
-        self.policy.to(self.device)
-
-        # Load preprocessor and postprocessor, overriding device to match requested device
-        device_override = {"device": self.device}
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.policy.config,
-            pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
-            postprocessor_overrides={"device_processor": device_override},
-        )
-
-        end = time.perf_counter()
-
-        self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
-
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""
-        client_id = context.peer()
+        authorized, client_id = self._validate_client(context)
+        if not authorized:
+            return services_pb2.Empty()
         self.logger.debug(f"Receiving observations from {client_id}")
 
         receive_time = time.time()  # comparing timestamps so need time.time()
@@ -214,7 +332,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def GetActions(self, request, context):  # noqa: N802
         """Returns actions to the robot client. Actions are sent as a single
         chunk, containing multiple actions."""
-        client_id = context.peer()
+        authorized, client_id = self._validate_client(context)
+        if not authorized:
+            return services_pb2.Actions()
         self.logger.debug(f"Client {client_id} connected for action streaming")
 
         # Generate action based on the most recent observation and its timestep
@@ -258,12 +378,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return actions
 
         except Empty:  # no observation added to queue in obs_queue_timeout
-            return services_pb2.Empty()
+            return services_pb2.Actions()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
-
-            return services_pb2.Empty()
+            self.logger.exception("Policy inference failed")
+            context.abort(grpc.StatusCode.INTERNAL, f"Policy inference failed: {e}")
 
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
         """Check if the observation is valid to be processed by the policy"""
@@ -321,7 +440,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+        with torch.inference_mode():
+            chunk = self.policy.predict_action_chunk(observation)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -421,6 +541,7 @@ def serve(cfg: PolicyServerConfig):
 
     # Create the server instance first
     policy_server = PolicyServer(cfg)
+    policy_server.preload_configured_policy()
 
     # Setup and start gRPC server
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))

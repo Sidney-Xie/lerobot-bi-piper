@@ -41,6 +41,8 @@ from .context import (
 from .inference import (
     InferenceEngine,
     InferenceEngineConfig,
+    OpenPIWebSocketInferenceConfig,
+    OpenPIWebSocketInferenceEngine,
     RTCInferenceConfig,
     RTCInferenceEngine,
     SyncInferenceConfig,
@@ -72,6 +74,8 @@ __all__ = [
     "EpisodicStrategyConfig",
     "InferenceEngine",
     "InferenceEngineConfig",
+    "OpenPIWebSocketInferenceConfig",
+    "OpenPIWebSocketInferenceEngine",
     "PolicyContext",
     "ProcessorContext",
     "RTCInferenceConfig",

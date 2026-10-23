@@ -990,6 +990,7 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
             ImportError: If a step class cannot be imported or found in registry
             ValueError: If a step cannot be instantiated with its configuration
         """
+        loaded_config = cls._resolve_local_artifacts(loaded_config, base_path, is_local_source)
         steps, remaining_override_keys = cls._build_steps_from_config(loaded_config, overrides)
 
         for step_instance, step_entry in zip(steps, loaded_config["steps"], strict=True):
@@ -998,6 +999,37 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
             )
 
         return steps, remaining_override_keys
+
+    @staticmethod
+    def _resolve_local_artifacts(
+        loaded_config: dict[str, Any], base_path: Path | None, is_local_source: bool
+    ) -> dict[str, Any]:
+        """Resolve processor artifacts bundled beside a local pipeline config.
+
+        Exported Pi0/Pi05 pipelines may store a tokenizer as an artifact with a
+        relative value such as ``"tokenizer"``.  Passing that value directly to
+        ``AutoTokenizer.from_pretrained`` makes Transformers interpret it as a
+        Hub repository id.  For local checkpoints, rewrite only artifact values
+        that actually exist below the pipeline directory; Hub ids and missing
+        optional artifacts remain unchanged.
+        """
+        if not is_local_source or base_path is None:
+            return loaded_config
+
+        resolved_config = deepcopy(loaded_config)
+        for step in resolved_config.get("steps", []):
+            artifacts = step.get("artifacts", {})
+            config = step.setdefault("config", {})
+            for key, artifact in artifacts.items():
+                if not isinstance(artifact, str):
+                    continue
+                artifact_path = Path(artifact)
+                if artifact_path.is_absolute():
+                    continue
+                candidate = base_path / artifact_path
+                if candidate.exists():
+                    config[key] = str(candidate)
+        return resolved_config
 
     @classmethod
     def _build_steps_from_config(

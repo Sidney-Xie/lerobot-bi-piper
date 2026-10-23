@@ -65,6 +65,7 @@ class SyncInferenceEngine(InferenceEngine):
         device: str | None,
         robot_type: str,
     ) -> None:
+        super().__init__()
         self._policy = policy
         self._preprocessor = preprocessor
         self._postprocessor = postprocessor
@@ -81,6 +82,7 @@ class SyncInferenceEngine(InferenceEngine):
 
     def start(self) -> None:
         """No background resources to start."""
+        self._reset_inference_telemetry()
         logger.info("SyncInferenceEngine started (inline mode — no background thread)")
 
     def stop(self) -> None:
@@ -90,6 +92,7 @@ class SyncInferenceEngine(InferenceEngine):
     def reset(self) -> None:
         """Reset the policy and pre/post-processors."""
         logger.info("Resetting sync inference state (policy + processors)")
+        self._reset_inference_telemetry()
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
@@ -98,6 +101,7 @@ class SyncInferenceEngine(InferenceEngine):
         """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
         if obs_frame is None:
             return None
+        attempt = self._begin_inference()
         # Shallow copy is intentional: the caller (`send_next_action`) builds
         # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
         # tensor/array values are not shared with any other reader.
@@ -119,4 +123,6 @@ class SyncInferenceEngine(InferenceEngine):
         # Reorder to match dataset action ordering so the caller can treat
         # the returned tensor uniformly across backends.
         action_dict = make_robot_action(action_tensor, self._dataset_features)
-        return torch.tensor([action_dict[k] for k in self._ordered_action_keys])
+        result = torch.tensor([action_dict[k] for k in self._ordered_action_keys])
+        self._finish_inference(attempt)
+        return result

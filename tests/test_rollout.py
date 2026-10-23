@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -98,6 +99,35 @@ def test_inference_config_types():
     assert rtc.type == "rtc"
     assert rtc.queue_threshold == 30
     assert rtc.rtc is not None
+
+
+def test_resolve_action_key_order_maps_legacy_piper_joint_names():
+    from lerobot.rollout.context import _resolve_action_key_order
+
+    dataset_names = [
+        f"{side}_{joint}.pos"
+        for side in ("left", "right")
+        for joint in ("j1", "j2", "j3", "j4", "j5", "j6", "gripper")
+    ]
+    legacy_names = [
+        f"{side}_{joint}"
+        for side in ("right", "left")
+        for joint in (
+            "wrist_rotate",
+            "wrist_angle",
+            "forearm_roll",
+            "elbow",
+            "shoulder",
+            "waist",
+            "gripper",
+        )
+    ]
+
+    assert _resolve_action_key_order(legacy_names, dataset_names) == [
+        f"{side}_{joint}.pos"
+        for side in ("right", "left")
+        for joint in ("j6", "j5", "j4", "j3", "j2", "j1", "gripper")
+    ]
 
 
 def test_sentry_config_defaults():
@@ -216,6 +246,261 @@ def test_load_pretrained_peft_policy_keeps_adapter_and_base_revisions_separate(m
         config=peft_config,
         revision="adapter-sha",
     )
+
+
+def test_connect_rollout_hardware_disconnects_robot_when_initial_observation_fails():
+    from lerobot.rollout.context import _connect_rollout_hardware
+
+    robot = MagicMock()
+    robot.get_observation.side_effect = RuntimeError("feedback unavailable")
+
+    with pytest.raises(RuntimeError, match="feedback unavailable"):
+        _connect_rollout_hardware(robot, None)
+
+    robot.connect.assert_called_once_with()
+    robot.disconnect.assert_called_once_with()
+
+
+def test_connect_rollout_hardware_rolls_back_teleop_and_robot():
+    from lerobot.rollout.context import _connect_rollout_hardware
+
+    robot = MagicMock()
+    robot.get_observation.return_value = {"joint.pos": 1.25, "camera": object()}
+    teleop = MagicMock()
+    teleop.connect.side_effect = RuntimeError("leader unavailable")
+
+    with pytest.raises(RuntimeError, match="leader unavailable"):
+        _connect_rollout_hardware(robot, teleop)
+
+    teleop.disconnect.assert_called_once_with()
+    robot.disconnect.assert_called_once_with()
+
+
+def test_rollout_teardown_recovers_hardware_fault_before_returning():
+    from lerobot.rollout import BaseStrategy, BaseStrategyConfig
+    from lerobot.rollout.context import HardwareContext
+
+    robot = MagicMock(is_connected=True, has_hardware_fault=True)
+    robot.recover_for_safe_return.return_value = True
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = MagicMock()
+    strategy._return_to_initial_position = MagicMock(return_value=True)
+    hardware = HardwareContext(
+        robot_wrapper=SimpleNamespace(inner=robot), teleop=None, initial_position={"joint.pos": 0.0}
+    )
+
+    strategy._teardown_hardware(hardware)
+
+    robot.recover_for_safe_return.assert_called_once_with()
+    strategy._return_to_initial_position.assert_called_once_with(hardware)
+    robot.preserve_torque_for_manual_recovery.assert_not_called()
+    robot.disconnect.assert_called_once_with()
+
+
+def test_rollout_teardown_preserves_torque_when_fault_recovery_fails():
+    from lerobot.rollout import BaseStrategy, BaseStrategyConfig
+    from lerobot.rollout.context import HardwareContext
+
+    robot = MagicMock(is_connected=True, has_hardware_fault=True)
+    robot.recover_for_safe_return.return_value = False
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = MagicMock()
+    strategy._engine.stop.side_effect = RuntimeError("worker stuck")
+    strategy._return_to_initial_position = MagicMock(return_value=True)
+    hardware = HardwareContext(
+        robot_wrapper=SimpleNamespace(inner=robot), teleop=None, initial_position={"joint.pos": 0.0}
+    )
+
+    strategy._teardown_hardware(hardware)
+
+    strategy._return_to_initial_position.assert_not_called()
+    robot.preserve_torque_for_manual_recovery.assert_called_once_with()
+    robot.disconnect.assert_called_once_with()
+
+
+def test_send_next_action_suppresses_dispatch_when_get_action_requests_shutdown(monkeypatch):
+    from lerobot.rollout.strategies import core
+
+    shutdown_event = Event()
+    engine = MagicMock(failed=False)
+    engine.get_action.side_effect = lambda _obs: (shutdown_event.set(), torch.tensor([1.25]))[1]
+    interpolator = MagicMock()
+    interpolator.needs_new_action.return_value = True
+    interpolator.get.return_value = torch.tensor([1.25])
+    robot = MagicMock()
+    processor = MagicMock(return_value={"joint.pos": 1.25})
+    ctx = SimpleNamespace(
+        policy=SimpleNamespace(inference=engine),
+        data=SimpleNamespace(dataset_features={}, ordered_action_keys=["joint.pos"]),
+        processors=SimpleNamespace(robot_action_processor=processor),
+        hardware=SimpleNamespace(robot_wrapper=robot),
+        runtime=SimpleNamespace(shutdown_event=shutdown_event),
+    )
+    monkeypatch.setattr(core, "build_dataset_frame", lambda *_args, **_kwargs: {})
+
+    result = core.send_next_action({}, {}, ctx, interpolator)
+
+    assert result is None
+    processor.assert_called_once()
+    robot.send_action.assert_not_called()
+
+
+def test_send_next_action_suppresses_dispatch_when_processor_observes_engine_failure(monkeypatch):
+    from lerobot.rollout.strategies import core
+
+    engine = MagicMock(failed=False)
+    engine.get_action.return_value = torch.tensor([1.25])
+    interpolator = MagicMock()
+    interpolator.needs_new_action.return_value = True
+    interpolator.get.return_value = torch.tensor([1.25])
+    robot = MagicMock()
+
+    def mark_engine_failed(action_and_observation):
+        engine.failed = True
+        return action_and_observation[0]
+
+    processor = MagicMock(side_effect=mark_engine_failed)
+    ctx = SimpleNamespace(
+        policy=SimpleNamespace(inference=engine),
+        data=SimpleNamespace(dataset_features={}, ordered_action_keys=["joint.pos"]),
+        processors=SimpleNamespace(robot_action_processor=processor),
+        hardware=SimpleNamespace(robot_wrapper=robot),
+        runtime=SimpleNamespace(shutdown_event=Event()),
+    )
+    monkeypatch.setattr(core, "build_dataset_frame", lambda *_args, **_kwargs: {})
+
+    result = core.send_next_action({}, {}, ctx, interpolator)
+
+    assert result is None
+    processor.assert_called_once()
+    robot.send_action.assert_not_called()
+
+
+def test_fatal_rtc_worker_failure_stops_rollout_before_next_dispatch(monkeypatch):
+    from lerobot.rollout.inference import rtc
+    from lerobot.rollout.inference.base import InferenceEngine
+    from lerobot.rollout.strategies import core
+
+    shutdown_event = Event()
+    engine = object.__new__(rtc.RTCInferenceEngine)
+    InferenceEngine.__init__(engine)
+    engine._fps = 25.0
+    engine._device = "cpu"
+    engine._use_torch_compile = False
+    engine._compile_warmup_inferences = 0
+    engine._rtc_queue_threshold = 30
+    engine._action_queue = MagicMock()
+    engine._action_queue.qsize.return_value = 0
+    engine._action_queue.get_action_index.return_value = 0
+    engine._action_queue.get_left_over.return_value = None
+    engine._obs_holder = {"obs": {"joint.pos": 0.0}}
+    engine._obs_lock = Lock()
+    engine._policy_active = Event()
+    engine._policy_active.set()
+    engine._compile_warmup_done = Event()
+    engine._shutdown_event = Event()
+    engine._rtc_error = Event()
+    engine._global_shutdown_event = shutdown_event
+    engine._relative_step = None
+    engine._normalizer_step = None
+    engine._hw_features = {}
+    engine._task = "test"
+    engine._robot = SimpleNamespace(robot_type="mock")
+    engine._policy = MagicMock()
+    engine._policy.predict_action_chunk.side_effect = RuntimeError("inference failed")
+    engine._preprocessor = MagicMock(return_value={})
+    engine._postprocessor = MagicMock()
+
+    monkeypatch.setattr(rtc, "build_dataset_frame", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(rtc, "prepare_observation_for_inference", lambda obs, *_args: obs)
+    monkeypatch.setattr(rtc.time, "sleep", lambda _seconds: None)
+
+    engine._rtc_loop()
+
+    assert engine.failed is True
+    assert shutdown_event.is_set()
+    assert engine._policy.predict_action_chunk.call_count == rtc._RTC_MAX_CONSECUTIVE_ERRORS
+    telemetry = engine.get_inference_telemetry()
+    assert telemetry["chunk_id"] == rtc._RTC_MAX_CONSECUTIVE_ERRORS - 1
+    assert telemetry["inference_started_ns"] is not None
+    assert telemetry["inference_finished_ns"] is None
+    assert telemetry["inference_latency_ms"] is None
+    assert telemetry["queue_size"] == 0
+
+    engine._action_queue.get.return_value = torch.tensor([1.25])
+    interpolator = MagicMock()
+    interpolator.needs_new_action.return_value = True
+    interpolator.get.return_value = torch.tensor([1.25])
+    robot = MagicMock()
+    processor = MagicMock(return_value={"joint.pos": 1.25})
+    ctx = SimpleNamespace(
+        policy=SimpleNamespace(inference=engine),
+        data=SimpleNamespace(dataset_features={}, ordered_action_keys=["joint.pos"]),
+        processors=SimpleNamespace(robot_action_processor=processor),
+        hardware=SimpleNamespace(robot_wrapper=robot),
+        runtime=SimpleNamespace(shutdown_event=shutdown_event),
+    )
+    monkeypatch.setattr(core, "build_dataset_frame", lambda *_args, **_kwargs: {})
+
+    assert core.send_next_action({}, {}, ctx, interpolator) is None
+    processor.assert_called_once()
+    robot.send_action.assert_not_called()
+
+
+def test_rtc_worker_reports_completed_chunk_telemetry(monkeypatch):
+    from lerobot.rollout.inference import rtc
+    from lerobot.rollout.inference.base import InferenceEngine
+
+    engine = object.__new__(rtc.RTCInferenceEngine)
+    InferenceEngine.__init__(engine)
+    engine._fps = 25.0
+    engine._device = "cpu"
+    engine._use_torch_compile = False
+    engine._compile_warmup_inferences = 0
+    engine._rtc_queue_threshold = 30
+    engine._shutdown_event = Event()
+    queue_size = 0
+
+    def merge_chunk(*_args, **_kwargs):
+        nonlocal queue_size
+        queue_size = 12
+        engine._shutdown_event.set()
+
+    engine._action_queue = MagicMock()
+    engine._action_queue.qsize.side_effect = lambda: queue_size
+    engine._action_queue.get_action_index.return_value = 0
+    engine._action_queue.get_left_over.return_value = None
+    engine._action_queue.merge.side_effect = merge_chunk
+    engine._obs_holder = {"obs": {"joint.pos": 0.0}}
+    engine._obs_lock = Lock()
+    engine._policy_active = Event()
+    engine._policy_active.set()
+    engine._compile_warmup_done = Event()
+    engine._rtc_error = Event()
+    engine._global_shutdown_event = Event()
+    engine._relative_step = None
+    engine._normalizer_step = None
+    engine._hw_features = {}
+    engine._task = "test"
+    engine._robot = SimpleNamespace(robot_type="mock")
+    actions = torch.tensor([[[1.25], [1.5]]])
+    engine._policy = MagicMock()
+    engine._policy.predict_action_chunk.return_value = actions
+    engine._preprocessor = MagicMock(return_value={})
+    engine._postprocessor = MagicMock(return_value=actions)
+
+    monkeypatch.setattr(rtc, "build_dataset_frame", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(rtc, "prepare_observation_for_inference", lambda obs, *_args: obs)
+
+    engine._rtc_loop()
+
+    telemetry = engine.get_inference_telemetry()
+    assert telemetry["chunk_id"] == 0
+    assert telemetry["inference_started_ns"] is not None
+    assert telemetry["inference_finished_ns"] >= telemetry["inference_started_ns"]
+    assert telemetry["inference_latency_ms"] >= 0
+    assert telemetry["queue_size"] == 12
+    assert not engine.failed
 
 
 # ---------------------------------------------------------------------------

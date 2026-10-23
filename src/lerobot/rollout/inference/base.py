@@ -22,8 +22,74 @@ or asynchronously in a background thread (RTC).
 from __future__ import annotations
 
 import abc
+import time
+from dataclasses import dataclass
+from threading import Lock
 
 import torch
+
+
+@dataclass(frozen=True, slots=True)
+class _InferenceAttempt:
+    chunk_id: int
+    generation: int
+    started_perf_ns: int
+
+
+class _InferenceTelemetryTracker:
+    """Thread-safe timing state shared by all inference backends."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._generation = 0
+        self._next_chunk_id = 0
+        self._chunk_id: int | None = None
+        self._started_ns: int | None = None
+        self._finished_ns: int | None = None
+        self._latency_ms: float | None = None
+
+    def reset(self) -> None:
+        with self._lock:
+            self._generation += 1
+            self._next_chunk_id = 0
+            self._chunk_id = None
+            self._started_ns = None
+            self._finished_ns = None
+            self._latency_ms = None
+
+    def begin(self) -> _InferenceAttempt:
+        started_ns = time.time_ns()
+        started_perf_ns = time.perf_counter_ns()
+        with self._lock:
+            chunk_id = self._next_chunk_id
+            self._next_chunk_id += 1
+            self._chunk_id = chunk_id
+            self._started_ns = started_ns
+            self._finished_ns = None
+            self._latency_ms = None
+            generation = self._generation
+        return _InferenceAttempt(chunk_id, generation, started_perf_ns)
+
+    def finish(self, attempt: _InferenceAttempt) -> None:
+        finished_perf_ns = time.perf_counter_ns()
+        finished_ns = time.time_ns()
+        with self._lock:
+            # Ignore a result that completed after an episode reset or after a
+            # newer request superseded this one.
+            if self._generation != attempt.generation or self._chunk_id != attempt.chunk_id:
+                return
+            self._finished_ns = finished_ns
+            self._latency_ms = (finished_perf_ns - attempt.started_perf_ns) / 1_000_000.0
+
+    def snapshot(self, queue_size: int) -> dict[str, int | float | None]:
+        with self._lock:
+            return {
+                "inference_started_ns": self._started_ns,
+                "inference_finished_ns": self._finished_ns,
+                "inference_latency_ms": self._latency_ms,
+                "queue_size": queue_size,
+                "chunk_id": self._chunk_id,
+            }
 
 
 class InferenceEngine(abc.ABC):
@@ -52,6 +118,25 @@ class InferenceEngine(abc.ABC):
     ``notify_observation`` / ``pause`` / ``resume`` have a no-op default
     so rollout strategies can invoke them unconditionally.
     """
+
+    def __init__(self) -> None:
+        self._inference_telemetry = _InferenceTelemetryTracker()
+
+    def _begin_inference(self) -> _InferenceAttempt:
+        return self._inference_telemetry.begin()
+
+    def _finish_inference(self, attempt: _InferenceAttempt) -> None:
+        self._inference_telemetry.finish(attempt)
+
+    def _reset_inference_telemetry(self) -> None:
+        self._inference_telemetry.reset()
+
+    def _inference_queue_size(self) -> int:
+        return 0
+
+    def get_inference_telemetry(self) -> dict[str, int | float | None]:
+        """Return an atomic timing snapshot plus the backend's live queue depth."""
+        return self._inference_telemetry.snapshot(self._inference_queue_size())
 
     @abc.abstractmethod
     def start(self) -> None:

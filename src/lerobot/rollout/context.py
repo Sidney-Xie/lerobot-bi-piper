@@ -54,6 +54,8 @@ from lerobot.utils.import_utils import _peft_available, require_package
 from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
 from .inference import (
     InferenceEngine,
+    OpenPIWebSocketInferenceConfig,
+    RemoteInferenceConfig,
     RTCInferenceConfig,
     SyncInferenceConfig,
     create_inference_engine,
@@ -68,6 +70,16 @@ else:
     PeftModel = None
 
 logger = logging.getLogger(__name__)
+
+_PIPER_LEGACY_ACTION_ALIASES = {
+    "waist": "j1",
+    "shoulder": "j2",
+    "elbow": "j3",
+    "forearm_roll": "j4",
+    "wrist_angle": "j5",
+    "wrist_rotate": "j6",
+    "gripper": "gripper",
+}
 
 
 def _wrap_predict_action_chunk_with_torch_compile(
@@ -113,10 +125,36 @@ def _resolve_action_key_order(
             len(dataset_action_names),
         )
         return dataset_action_names
-    if set(dataset_action_names) != set(policy_action_names):
-        logger.warning("policy.action_feature_names keys don't match dataset; using dataset order")
-        return dataset_action_names
-    return policy_action_names
+    if set(dataset_action_names) == set(policy_action_names):
+        return policy_action_names
+
+    # Older converted checkpoints store names such as ``left_waist`` while
+    # current robot features append a semantic suffix (usually ``.pos``).
+    # Preserve policy order when the unsuffixed names identify the hardware
+    # features uniquely.
+    dataset_by_stem: dict[str, str] = {}
+    ambiguous_stems: set[str] = set()
+    for dataset_name in dataset_action_names:
+        stem = dataset_name.removesuffix(".pos").removesuffix(".vel")
+        if stem in dataset_by_stem:
+            ambiguous_stems.add(stem)
+        dataset_by_stem[stem] = dataset_name
+
+    def canonical_policy_stem(name: str) -> str:
+        stem = name.removesuffix(".pos").removesuffix(".vel")
+        side, separator, joint = stem.partition("_")
+        if separator and side in {"left", "right"} and joint in _PIPER_LEGACY_ACTION_ALIASES:
+            return f"{side}_{_PIPER_LEGACY_ACTION_ALIASES[joint]}"
+        return stem
+
+    policy_stems = [canonical_policy_stem(name) for name in policy_action_names]
+    mapped_names = [dataset_by_stem.get(name) for name in policy_stems]
+    if not ambiguous_stems.intersection(policy_stems) and all(mapped_names):
+        logger.info("Mapped policy action names to LeRobot hardware features")
+        return [name for name in mapped_names if name is not None]
+
+    logger.warning("policy.action_feature_names keys don't match dataset; using dataset order")
+    return dataset_action_names
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +168,11 @@ class RuntimeContext:
 
     cfg: RolloutConfig
     shutdown_event: Event
+    last_policy_action: dict | None = None
+    last_processed_action: dict | None = None
+    last_sent_action: dict | None = None
+    last_send_success: bool = False
+    last_send_error: str | None = None
 
 
 @dataclass
@@ -152,11 +195,15 @@ class HardwareContext:
 
 @dataclass
 class PolicyContext:
-    """Loaded policy and its inference engine."""
+    """Policy resources and their inference engine.
 
-    policy: PreTrainedPolicy
-    preprocessor: PolicyProcessorPipeline
-    postprocessor: PolicyProcessorPipeline
+    The model and processors are absent on a remote inference client because
+    those heavyweight resources live in the policy server.
+    """
+
+    policy: PreTrainedPolicy | None
+    preprocessor: PolicyProcessorPipeline | None
+    postprocessor: PolicyProcessorPipeline | None
     inference: InferenceEngine
 
 
@@ -227,6 +274,38 @@ def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy
     )
 
 
+def _connect_rollout_hardware(robot, teleop: Teleoperator | None) -> dict:
+    """Connect hardware as the final build step and roll back partial startup."""
+    robot_connect_attempted = False
+    teleop_connect_attempted = False
+    try:
+        robot_connect_attempted = True
+        robot.connect()
+        initial_obs = robot.get_observation()
+        initial_position = {key: value for key, value in initial_obs.items() if key.endswith(".pos")}
+
+        if teleop is not None:
+            teleop_connect_attempted = True
+            teleop.connect()
+        return initial_position
+    except Exception:
+        if teleop_connect_attempted:
+            try:
+                teleop.disconnect()
+            except Exception:
+                logger.exception("Failed to disconnect teleoperator during rollout startup rollback")
+
+        if robot_connect_attempted:
+            preserve_torque = getattr(robot, "preserve_torque_for_manual_recovery", None)
+            if bool(getattr(robot, "has_hardware_fault", False)) and callable(preserve_torque):
+                preserve_torque()
+            try:
+                robot.disconnect()
+            except Exception:
+                logger.exception("Failed to disconnect robot during rollout startup rollback")
+        raise
+
+
 def build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
@@ -240,50 +319,71 @@ def build_rollout_context(
     fails fast without touching the robot.
     """
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
+    is_remote = isinstance(cfg.inference, RemoteInferenceConfig)
+    is_openpi = isinstance(cfg.inference, OpenPIWebSocketInferenceConfig)
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
-    logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
     policy_config = cfg.policy
+    policy: PreTrainedPolicy | None = None
+    torch_compile_active = False
 
-    if hasattr(policy_config, "compile_model"):
-        policy_config.compile_model = cfg.use_torch_compile
-
-    if policy_config.type == "vqbet" and cfg.device == "mps":
-        raise NotImplementedError(
-            "Current implementation of VQBeT does not support `mps` backend. "
-            "Please use `cpu` or `cuda` backend."
-        )
-
-    policy = _load_pretrained_policy(policy_config)
-
-    if is_rtc:
-        if not supports_rtc_inference(policy):
+    if is_remote or is_openpi:
+        if is_remote:
+            require_package("grpcio", extra="async", import_name="grpc")
+        if cfg.use_torch_compile:
             raise ValueError(
-                f"RTC inference is not supported by policy type '{policy_config.type}': "
-                "the policy must implement RTC semantics and predict_action_chunk must accept "
-                "inference_delay and prev_chunk_left_over. Use '--inference.type=sync' instead."
+                "--use_torch_compile is a local rollout option and cannot be used with "
+                f"--inference.type={cfg.inference.type}"
             )
-        policy.config.rtc_config = cfg.inference.rtc
-        if hasattr(policy, "init_rtc_processor"):
-            policy.init_rtc_processor()
+        if is_remote:
+            logger.info(
+                "Remote inference selected; policy weights remain on %s", cfg.inference.server_address
+            )
+        else:
+            logger.info(
+                "OpenPI WebSocket inference selected; JAX weights remain on %s", cfg.inference.server_address
+            )
+    else:
+        logger.info("Loading policy from '%s'...", policy_config.pretrained_path)
+        if hasattr(policy_config, "compile_model"):
+            policy_config.compile_model = cfg.use_torch_compile
 
-    policy = policy.to(cfg.device)
-    policy.eval()
-    logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
+        if policy_config.type == "vqbet" and cfg.device == "mps":
+            raise NotImplementedError(
+                "Current implementation of VQBeT does not support `mps` backend. "
+                "Please use `cpu` or `cuda` backend."
+            )
 
-    torch_compile_active = cfg.use_torch_compile
-    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
-        torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
-            policy,
-            backend=cfg.torch_compile_backend,
-            mode=cfg.torch_compile_mode,
-        )
+        policy = _load_pretrained_policy(policy_config)
 
-    if cfg.use_torch_compile and not torch_compile_active:
-        # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
-        # dataclasses.replace when carrying the effective state downstream.
-        cfg = copy(cfg)
-        cfg.use_torch_compile = False
+        if is_rtc:
+            if not supports_rtc_inference(policy):
+                raise ValueError(
+                    f"RTC inference is not supported by policy type '{policy_config.type}': "
+                    "the policy must implement RTC semantics and predict_action_chunk must accept "
+                    "inference_delay and prev_chunk_left_over. Use '--inference.type=sync' instead."
+                )
+            policy.config.rtc_config = cfg.inference.rtc
+            if hasattr(policy, "init_rtc_processor"):
+                policy.init_rtc_processor()
+
+        policy = policy.to(cfg.device)
+        policy.eval()
+        logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
+
+        torch_compile_active = cfg.use_torch_compile
+        if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
+            torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
+                policy,
+                backend=cfg.torch_compile_backend,
+                mode=cfg.torch_compile_mode,
+            )
+
+        if cfg.use_torch_compile and not torch_compile_active:
+            # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
+            # dataclasses.replace when carrying the effective state downstream.
+            cfg = copy(cfg)
+            cfg.use_torch_compile = False
 
     # --- 2. Robot-side processors (user-supplied or defaults) --------
     if (
@@ -296,25 +396,10 @@ def build_rollout_context(
         robot_action_processor = robot_action_processor or _r
         robot_observation_processor = robot_observation_processor or _o
 
-    # --- 3. Hardware (heaviest side-effect, deferred) -----------------
-    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
+    # --- 3. Hardware objects (connections remain closed) --------------
     robot = make_robot_from_config(cfg.robot)
-    robot.connect()
-    logger.info("Robot connected: %s", robot.name)
-
-    # Store the initial joint positions so we can return to a safe pose on shutdown.
-    initial_obs = robot.get_observation()
-    initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
-    logger.info("Captured initial robot position (%d keys)", len(initial_position))
-
     robot_wrapper = ThreadSafeRobot(robot)
-
-    teleop = None
-    if cfg.teleop is not None:
-        logger.info("Connecting teleoperator (%s)...", cfg.teleop.type if cfg.teleop else "?")
-        teleop = make_teleoperator_from_config(cfg.teleop)
-        teleop.connect()
-        logger.info("Teleoperator connected")
+    teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     # TODO(Steven): once Teleoperator motor-control methods are standardised
     # (``enable_torque`` / ``disable_torque`` / ``write_goal_positions``), gate
@@ -463,16 +548,19 @@ def build_rollout_context(
             cfg.rename_map,
         )
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy_config,
-        pretrained_path=cfg.policy.pretrained_path,
-        pretrained_revision=policy_config.pretrained_revision,
-        dataset_stats=dataset_stats,
-        preprocessor_overrides={
-            "device_processor": {"device": cfg.device},
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        },
-    )
+    preprocessor: PolicyProcessorPipeline | None = None
+    postprocessor: PolicyProcessorPipeline | None = None
+    if not is_remote and not is_openpi:
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy_config,
+            pretrained_path=cfg.policy.pretrained_path,
+            pretrained_revision=policy_config.pretrained_revision,
+            dataset_stats=dataset_stats,
+            preprocessor_overrides={
+                "device_processor": {"device": cfg.device},
+                "rename_observations_processor": {"rename_map": cfg.rename_map},
+            },
+        )
 
     if isinstance(cfg.inference, SyncInferenceConfig) and any(
         isinstance(step, RelativeActionsProcessorStep) and step.enabled
@@ -494,6 +582,7 @@ def build_rollout_context(
         policy=policy,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
+        policy_config=policy_config,
         robot_wrapper=robot_wrapper,
         hw_features=hw_features,
         dataset_features=dataset_features,
@@ -504,9 +593,18 @@ def build_rollout_context(
         use_torch_compile=torch_compile_active,
         compile_warmup_inferences=cfg.compile_warmup_inferences,
         shutdown_event=shutdown_event,
+        rename_map=cfg.rename_map,
     )
 
-    # --- 8. Assemble ---------------------------------------------------
+    # --- 8. Connect hardware only after every software check passed ---
+    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
+    initial_position = _connect_rollout_hardware(robot, teleop)
+    logger.info("Robot connected: %s", robot.name)
+    logger.info("Captured initial robot position (%d keys)", len(initial_position))
+    if teleop is not None:
+        logger.info("Teleoperator connected: %s", cfg.teleop.type)
+
+    # --- 9. Assemble ---------------------------------------------------
     logger.info("Rollout context assembled successfully")
     return RolloutContext(
         runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),

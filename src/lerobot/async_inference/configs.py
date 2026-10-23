@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from numbers import Integral, Real
 
 import torch
 
@@ -32,6 +34,14 @@ AGGREGATE_FUNCTIONS = {
     "average": lambda old, new: 0.5 * old + 0.5 * new,
     "conservative": lambda old, new: 0.7 * old + 0.3 * new,
 }
+
+
+def _is_finite_real(value: object) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_positive_integer(value: object) -> bool:
+    return isinstance(value, Integral) and not isinstance(value, bool) and value > 0
 
 
 def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
@@ -54,6 +64,19 @@ class PolicyServerConfig:
     host: str = field(default="localhost", metadata={"help": "Host address to bind the server to"})
     port: int = field(default=8080, metadata={"help": "Port number to bind the server to"})
 
+    # Optional eager loading. When omitted, the first client selects the policy.
+    policy_type: str | None = field(
+        default=None, metadata={"help": "Policy type to preload, for example pi05"}
+    )
+    policy_path: str | None = field(default=None, metadata={"help": "Checkpoint path or Hub id to preload"})
+    policy_device: str = field(default="cpu", metadata={"help": "Device used by the resident policy"})
+    pretrained_revision: str | None = field(
+        default=None, metadata={"help": "Optional Hub revision for the resident policy"}
+    )
+    rename_map: dict[str, str] = field(
+        default_factory=dict, metadata={"help": "Observation rename map for policy processors"}
+    )
+
     # Timing configuration
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
     inference_latency: float = field(
@@ -66,17 +89,28 @@ class PolicyServerConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
-        if self.port < 1 or self.port > 65535:
-            raise ValueError(f"Port must be between 1 and 65535, got {self.port}")
+        if not _is_positive_integer(self.port) or self.port > 65535:
+            raise ValueError(f"Port must be an integer between 1 and 65535, got {self.port!r}")
 
-        if self.environment_dt <= 0:
-            raise ValueError(f"environment_dt must be positive, got {self.environment_dt}")
+        if not _is_positive_integer(self.fps):
+            raise ValueError(f"fps must be a positive integer, got {self.fps!r}")
 
-        if self.inference_latency < 0:
-            raise ValueError(f"inference_latency must be non-negative, got {self.inference_latency}")
+        if not _is_finite_real(self.inference_latency) or self.inference_latency < 0:
+            raise ValueError(
+                f"inference_latency must be finite and non-negative, got {self.inference_latency!r}"
+            )
 
-        if self.obs_queue_timeout < 0:
-            raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+        if not _is_finite_real(self.obs_queue_timeout) or self.obs_queue_timeout < 0:
+            raise ValueError(
+                f"obs_queue_timeout must be finite and non-negative, got {self.obs_queue_timeout!r}"
+            )
+
+        if (self.policy_type is None) != (self.policy_path is None):
+            raise ValueError("policy_type and policy_path must either both be set or both be omitted")
+        if self.policy_type == "" or self.policy_path == "":
+            raise ValueError("policy_type and policy_path cannot be empty")
+        if not self.policy_device:
+            raise ValueError("policy_device cannot be empty")
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -96,6 +130,12 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "obs_queue_timeout": self.obs_queue_timeout,
+            "policy_type": self.policy_type,
+            "policy_path": self.policy_path,
+            "policy_device": self.policy_device,
+            "pretrained_revision": self.pretrained_revision,
+            "rename_map": self.rename_map,
         }
 
 
@@ -170,14 +210,16 @@ class RobotClientConfig:
         if not self.client_device:
             raise ValueError("client_device cannot be empty")
 
-        if self.chunk_size_threshold < 0 or self.chunk_size_threshold > 1:
-            raise ValueError(f"chunk_size_threshold must be between 0 and 1, got {self.chunk_size_threshold}")
+        if not _is_finite_real(self.chunk_size_threshold) or not 0 <= self.chunk_size_threshold <= 1:
+            raise ValueError(
+                f"chunk_size_threshold must be finite and between 0 and 1, got {self.chunk_size_threshold!r}"
+            )
 
-        if self.fps <= 0:
-            raise ValueError(f"fps must be positive, got {self.fps}")
+        if not _is_positive_integer(self.fps):
+            raise ValueError(f"fps must be a positive integer, got {self.fps!r}")
 
-        if self.actions_per_chunk <= 0:
-            raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
+        if not _is_positive_integer(self.actions_per_chunk):
+            raise ValueError(f"actions_per_chunk must be a positive integer, got {self.actions_per_chunk!r}")
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 

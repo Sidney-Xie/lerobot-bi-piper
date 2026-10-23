@@ -37,6 +37,7 @@ class BaseStrategy(RolloutStrategy):
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine."""
         self._init_engine(ctx)
+        self._init_telemetry(ctx)
         logger.info("Base strategy ready")
 
     def run(self, ctx: RolloutContext) -> None:
@@ -49,6 +50,7 @@ class BaseStrategy(RolloutStrategy):
         control_interval = interpolator.get_control_interval(cfg.fps)
 
         start_time = time.perf_counter()
+        step = 0
         engine.resume()
         logger.info("Base strategy control loop started")
 
@@ -65,8 +67,25 @@ class BaseStrategy(RolloutStrategy):
             if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
                 continue
 
-            action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
+            try:
+                action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
+            except Exception as exc:
+                ctx.runtime.last_send_error = f"inference_or_dispatch: {exc}"
+                self._log_control_cycle(
+                    step=step,
+                    obs_raw=obs,
+                    action_dict=None,
+                    control_dt=time.perf_counter() - loop_start,
+                )
+                raise
             self._log_telemetry(obs_processed, action_dict, ctx.runtime)
+            self._log_control_cycle(
+                step=step,
+                obs_raw=obs,
+                action_dict=action_dict,
+                control_dt=time.perf_counter() - loop_start,
+            )
+            step += 1
 
             dt = time.perf_counter() - loop_start
             if (sleep_t := control_interval - dt) > 0:
@@ -78,8 +97,11 @@ class BaseStrategy(RolloutStrategy):
 
     def teardown(self, ctx: RolloutContext) -> None:
         """Disconnect hardware and stop inference."""
-        self._teardown_hardware(
-            ctx.hardware,
-            return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
-        )
+        try:
+            self._teardown_hardware(
+                ctx.hardware,
+                return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
+            )
+        finally:
+            self._close_telemetry()
         logger.info("Base strategy teardown complete")

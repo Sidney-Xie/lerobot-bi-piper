@@ -119,6 +119,8 @@ from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_openarm_follower,
+    bi_piper,
+    bi_piperx,
     bi_rebot_b601_follower,
     bi_so_follower,
     earthrover_mini_plus,
