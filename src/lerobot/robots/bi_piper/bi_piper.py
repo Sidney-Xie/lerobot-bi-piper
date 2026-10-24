@@ -484,13 +484,18 @@ class BiPiper(Robot):
         )
 
     def _wait_for_recovery_feedback(self, allowed_statuses: set[int], deadline: float) -> bool:
+        last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
                 if all(self._feedback_ready_for_recovery(side, allowed_statuses) for side in _SIDES):
                     return True
-            except Exception:
-                pass
+            except Exception as error:
+                # Feedback reads may fail while the CAN bus is still recovering;
+                # keep polling until the deadline instead of aborting teardown.
+                last_error = error
             time.sleep(0.02)
+        if last_error is not None:
+            logger.debug("Piper recovery feedback read failed during recovery: %s", last_error)
         return False
 
     def recover_for_safe_return(self) -> bool:

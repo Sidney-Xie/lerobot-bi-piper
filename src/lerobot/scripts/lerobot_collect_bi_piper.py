@@ -281,7 +281,7 @@ def _preflight(args: argparse.Namespace) -> None:
         socket.if_nametoindex(name)
         if int((Path("/sys/class/net") / name / "type").read_text().strip()) != 280:
             raise RuntimeError(f"{name} is not a SocketCAN interface")
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B607: fixed diagnostic; iface name validated above
             ["ip", "-details", "link", "show", "dev", name], check=True, capture_output=True, text=True
         )
         if "can state ERROR-ACTIVE" not in result.stdout or not re.search(
